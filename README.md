@@ -337,6 +337,52 @@ The backend should reject it with a 403 response: `Forbidden SQL keyword detecte
 
 ---
 
+## Design Decisions
+
+### Why a decoupled backend and frontend
+
+I considered building this as a single monolithic Flask app with server-rendered templates, which would have been simpler to deploy. I went with a separate FastAPI backend and React frontend instead because the interactive ER diagram and the real-time query execution panel benefit significantly from a proper SPA. Server-rendered HTML would have made the diagram tab feel sluggish and required full page reloads for every sidebar interaction. The tradeoff is a slightly more involved setup (two processes), but the `start.sh` script mitigates that.
+
+### SQLAlchemy inspector vs. raw catalog queries
+
+The extraction engine uses SQLAlchemy's `inspect()` interface as the primary data source. This gives portable access to tables, columns, primary keys, foreign keys, and indexes across PostgreSQL and MySQL without writing dialect-specific SQL. However, `inspect()` does not expose everything: PostgreSQL enums live in `pg_type`/`pg_enum`, materialized views are in `pg_matviews`, and stored functions require `pg_proc`. For those, I drop down to raw `text()` queries against the system catalogs. This hybrid approach keeps the common path clean while still extracting the full picture.
+
+I initially considered using `information_schema` exclusively for everything, since it is SQL-standard. The problem is that `information_schema` does not cover PostgreSQL enums, materialized views, or function argument signatures in a useful way. The `pg_catalog` tables are more complete, so I used those for the Postgres-specific objects and kept `information_schema` queries only for MySQL enums and routines where it works well.
+
+### In-memory session management
+
+Engines are held in a Python dict keyed by `host:port/dbname`. I chose not to use a database or Redis for session storage because this is a single-user tool meant to run locally against a staging clone. Adding a persistence layer would have been overengineering for the use case. The tradeoff is that sessions do not survive a server restart, which is acceptable here.
+
+### React Flow for the ER diagram
+
+I evaluated a few options for the diagram: D3.js, Mermaid, and React Flow. D3 gives the most control but requires writing a lot of layout and interaction code from scratch. Mermaid is easy but produces static SVGs with no drag-and-drop. React Flow hit the right middle ground: it supports custom node components (so I could render column lists inside each table node), handles edge routing, and provides built-in zoom/pan/minimap out of the box. The main downside is that it adds a non-trivial bundle size (~100KB gzipped), but for a tool like this that is not performance-critical on initial load, it was worth it.
+
+### Text-to-SQL prompt design
+
+For the LLM integration, I build a compact schema context string rather than passing the full JSON extraction. The context includes only table names, column names with types, PK annotations, FK references, and enum definitions. Passing the entire JSON (which includes index names, check constraint expressions, default values, etc.) would burn through tokens without improving query generation quality. The system prompt explicitly restricts the model to read-only SELECT output. I set temperature to 0 because deterministic output matters more than creativity when generating SQL.
+
+I went with GPT-4o over smaller models because schema-aware SQL generation requires strong reasoning about joins and relationships. A cheaper model could work for simple single-table queries, but would struggle with multi-join questions involving foreign key traversal.
+
+### Dual-layer read-only enforcement
+
+The query executor checks for destructive keywords (INSERT, UPDATE, DELETE, DROP, etc.) and also verifies that the statement begins with SELECT, WITH, or EXPLAIN. This is defense-in-depth on top of the expectation that users connect with read-only database credentials. I considered parsing the SQL into an AST for more robust validation, but a keyword scan is sufficient for this scope and avoids pulling in a SQL parser dependency.
+
+### Credential handling
+
+Credentials are never persisted to disk. They exist only inside the SQLAlchemy engine's connection pool, which is disposed on disconnect or server shutdown. I intentionally did not add a "save connection" feature because the target use case is connecting to a read-only staging clone with temporary credentials, not managing a library of saved connections.
+
+---
+
+## Use of AI Tools
+
+I used Claude as a sounding board for a few specific tradeoffs during development. The main areas where I consulted it:
+
+- **Choosing between `information_schema` and `pg_catalog`** for enum and function extraction. I was initially going down the `information_schema` route for portability, but after discussing the coverage gaps with Claude, I decided the hybrid approach (SQLAlchemy inspector for common objects, raw catalog queries for dialect-specific ones) was the better path.
+- **React Flow vs. D3 vs. Mermaid** for the ER diagram component. I had prior experience with D3 but was weighing the implementation time against the interactivity requirements. Claude helped me think through the tradeoffs, and I landed on React Flow for the reasons described above.
+- **Prompt structure for Text-to-SQL**. I was going back and forth on how much schema context to pass to the LLM (full JSON vs. a minimized summary). Claude helped me think about token efficiency vs. query accuracy, and I went with the compact format that includes only what the model needs for SQL generation.
+
+---
+
 ## Project Structure
 
 ```
